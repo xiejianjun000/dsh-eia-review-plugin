@@ -3,6 +3,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools"
 import { NationalRuleEngine } from "./core/engine"
 import { ProvincialRegistry } from "./provinces/registry"
 import { DocumentParser } from "./parsers/document-parser"
+import { SourceAnalysisTool } from "./tools/source-analysis"
 import { MCPKnowledgeClient } from "./mcp/client"
 
 export const name = "dsh-eia-review-plugin"
@@ -25,6 +26,7 @@ export function apply(ctx: Context, config: Config) {
   const nationalEngine = new NationalRuleEngine()
   const provincialRegistry = new ProvincialRegistry()
   const parser = new DocumentParser()
+  const sourceAnalyzer = new SourceAnalysisTool()
 
   // 初始化 MCP 客户端（如果启用）
   let mcpClient: MCPKnowledgeClient | null = null
@@ -155,7 +157,31 @@ export function apply(ctx: Context, config: Config) {
   }))
 
   // ═══════════════════════════════════════════════════════════════════════
-  // 工具3: 行业标准查询（新增）
+  
+  // ═══════════════════════════════════════════════════════════════════════
+  // 工具2.5: 源强分析（新增）
+  // ═══════════════════════════════════════════════════════════════════════
+  ctx.tools.register(defineTool({
+    name: "eia_source_analysis",
+    description: "对环评报告中的污染物源强核算进行深度分析，自动识别源强数据、验证计算准确性、检查遗漏污染物。",
+    parameters: {
+      reportPath: { type: "string", required: true, description: "环评报告文件路径" },
+      industryCode: { type: "string", required: true, description: "行业代码(GB/T4754)" }
+    },
+    output: {
+      schema: { type: "object" },
+      render: (args, value) => [{
+        type: "text",
+        text: formatSourceAnalysis(value)
+      }]
+    },
+    async execute(args, exec) {
+      const doc = await parser.parse(args.reportPath)
+      return await sourceAnalyzer.analyze(doc, args.industryCode)
+    }
+  }))
+
+// 工具3: 行业标准查询（新增）
   // ═══════════════════════════════════════════════════════════════════════
   ctx.tools.register(defineTool({
     name: "eia_industry_info",
