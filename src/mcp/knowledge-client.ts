@@ -26,7 +26,7 @@ export interface KBStatus {
   status: "online" | "offline" | "error"
   version?: string
   lastSync?: string
-  documentCount?: number
+  documentCount?: number  // 知识库文档总数（约81,071篇）
 }
 
 /**
