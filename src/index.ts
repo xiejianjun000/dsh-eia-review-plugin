@@ -3,6 +3,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools"
 import { NationalRuleEngine } from "./core/engine"
 import { ProvincialRegistry } from "./provinces/registry"
 import { DocumentParser } from "./parsers/document-parser"
+import { RiskAssessmentValidationTool } from "./tools/risk-assessment-validation"
 import { PredictionModelValidationTool } from "./tools/prediction-model-validation"
 import { SourceAnalysisTool } from "./tools/source-analysis"
 import { MCPKnowledgeClient } from "./mcp/client"
@@ -29,6 +30,7 @@ export function apply(ctx: Context, config: Config) {
   const parser = new DocumentParser()
   const sourceAnalyzer = new SourceAnalysisTool()
   const predictionValidator = new PredictionModelValidationTool()
+  const riskValidator = new RiskAssessmentValidationTool()
 
   // 初始化 MCP 客户端（如果启用）
   let mcpClient: MCPKnowledgeClient | null = null
@@ -382,6 +384,80 @@ function formatPredictionModelValidation(value: any): string {
           text += `       建议: ${issue.suggestion}\n`
         })
       }
+      text += `\n`
+    })
+  }
+
+  return text
+}
+
+
+// 格式化环境风险评价验证结果
+function formatRiskAssessmentValidation(value: any): string {
+  let text = `## 环境风险评价验证报告\n\n`
+  text += `**总体评分**: ${value.overallScore}/100\n`
+  text += `**评价等级**: ${value.assessmentLevel || "未识别"}\n`
+  text += `**重大危险源**: ${value.hasMajorHazard ? "⚠️ 存在" : "✅ 不存在"}\n`
+  text += `**事故情景**: ${value.totalScenarios}个（通过${value.validScenarios} | 需复核${value.suspiciousScenarios} | 错误${value.errorScenarios}）\n\n`
+  text += `**分析摘要**: ${value.summary}\n\n`
+
+  if (value.details && value.details.length > 0) {
+    text += "### 验证详情\n\n"
+    value.details.forEach((section: any, idx: number) => {
+      const icon = section.issues.length === 0 ? "✅" : section.issues.some((i: any) => i.severity === "critical") ? "❌" : "⚠️"
+      text += `${idx + 1}. ${icon} **${section.riskType || section.assessmentLevel || "风险评价"}**\n`
+
+      // 危险物质识别
+      if (section.identifiedHazards && section.identifiedHazards.length > 0) {
+        text += `   **危险物质**:\n`
+        section.identifiedHazards.forEach((h: any) => {
+          const majorIcon = h.isMajor ? "🔴 重大危险源" : "🟢"
+          text += `     - ${h.substance}（CAS: ${h.CAS}）: 储存${h.maxStorage}吨 / 临界量${h.threshold}吨 = 比值${h.ratio.toFixed(2)} ${majorIcon}\n`
+        })
+      }
+
+      // 源项分析
+      if (section.sourceTermAnalysis && section.sourceTermAnalysis.length > 0) {
+        text += `   **源项分析**:\n`
+        section.sourceTermAnalysis.forEach((s: any) => {
+          text += `     - ${s.scenario}: 泄漏量${s.releaseAmount}吨，持续${s.releaseDuration}分钟，速率${s.releaseRate.toFixed(2)}吨/分钟\n`
+          if (s.issues.length > 0) {
+            s.issues.forEach((i: any) => {
+              text += `       ${i.severity === "critical" ? "🔴" : "🟡"} ${i.description}\n`
+            })
+          }
+        })
+      }
+
+      // 风险防范措施
+      if (section.preventionMeasures && section.preventionMeasures.length > 0) {
+        text += `   **风险防范措施**:\n`
+        section.preventionMeasures.forEach((pm: any) => {
+          text += `     - ${pm.category}: ${pm.items.length > 0 ? pm.items.join("、") : "无"}\n`
+          if (pm.missing.length > 0) {
+            text += `       ⚠️ 缺少: ${pm.missing.slice(0, 3).join("、")}${pm.missing.length > 3 ? "等" : ""}\n`
+          }
+        })
+      }
+
+      // 应急预案
+      if (section.emergencyPlan) {
+        text += `   **应急预案**: ${section.emergencyPlan.hasPlan ? "✅ 有" : "❌ 无"}预案 | ${section.emergencyPlan.hasDrill ? "✅ 有" : "❌ 无"}演练 | ${section.emergencyPlan.hasEquipment ? "✅ 有" : "❌ 无"}物资\n`
+        if (section.emergencyPlan.missingItems.length > 0) {
+          text += `     ⚠️ 缺少: ${section.emergencyPlan.missingItems.join("、")}\n`
+        }
+      }
+
+      // 问题汇总
+      if (section.issues.length > 0) {
+        text += `   **问题**:\n`
+        section.issues.forEach((issue: any) => {
+          const sev = issue.severity === "critical" ? "🔴" : issue.severity === "major" ? "🟡" : "🟢"
+          text += `     ${sev} [${issue.type}] ${issue.description}\n`
+          text += `       建议: ${issue.suggestion}\n`
+        })
+      }
+
       text += `\n`
     })
   }
