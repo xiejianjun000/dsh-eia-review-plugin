@@ -1,0 +1,19 @@
+# DSH 环评审查插件注册配置
+- insert:
+    # 主插件
+    - id: eia-review
+      name: 'dsh-eia-review-plugin'
+      config:
+        province: "zhejiang"
+        reviewMode: "both"
+        enableMCP: true
+        strictMode: true
+
+    # MCP 知识库客户端（可选）
+    - id: mcp-eia-kb
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: eia-kb
+        transport: stdio
+        command: npx
+        args: ['-y', 'mcp-eia-knowledge-server@1.0.0']
