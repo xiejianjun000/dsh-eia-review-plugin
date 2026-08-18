@@ -3,6 +3,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools"
 import { NationalRuleEngine } from "./core/engine"
 import { ProvincialRegistry } from "./provinces/registry"
 import { DocumentParser } from "./parsers/document-parser"
+import { PredictionModelValidationTool } from "./tools/prediction-model-validation"
 import { SourceAnalysisTool } from "./tools/source-analysis"
 import { MCPKnowledgeClient } from "./mcp/client"
 
@@ -27,6 +28,7 @@ export function apply(ctx: Context, config: Config) {
   const provincialRegistry = new ProvincialRegistry()
   const parser = new DocumentParser()
   const sourceAnalyzer = new SourceAnalysisTool()
+  const predictionValidator = new PredictionModelValidationTool()
 
   // 初始化 MCP 客户端（如果启用）
   let mcpClient: MCPKnowledgeClient | null = null
@@ -326,6 +328,61 @@ function formatIndustryInfo(info: any): string {
       text += `- ${p.name}\n`
       text += `  - 污染物: ${p.pollutants.map((pl: any) => `${pl.name}(${pl.typicalValue}${pl.unit})`).join("、")}\n`
       text += `  - 控制措施: ${p.controlMeasures.join("、")}\n\n`
+    })
+  }
+
+  return text
+}
+
+
+// 格式化预测模型验证结果
+function formatPredictionModelValidation(value: any): string {
+  let text = `## 环境影响预测模型验证报告\n\n`
+  text += `**总体评分**: ${value.overallScore}/100\n`
+  text += `**模型总数**: ${value.totalModels}个\n`
+  text += `**验证通过**: ${value.validModels}个 | **需复核**: ${value.suspiciousModels}个 | **错误**: ${value.errorModels}个\n\n`
+  text += `**分析摘要**: ${value.summary}\n\n`
+
+  if (value.details && value.details.length > 0) {
+    text += "### 模型验证详情\n\n"
+    value.details.forEach((item: any, idx: number) => {
+      const icon = item.issues.length === 0 ? "✅" : item.issues.some((i: any) => i.severity === "critical") ? "❌" : "⚠️"
+      text += `${idx + 1}. ${icon} **${item.modelName}**（${item.modelType}）\n`
+
+      if (Object.keys(item.reportedParameters).length > 0) {
+        text += `   - 报告参数: ${Object.entries(item.reportedParameters).map(([k, v]) => `${k}=${v}`).join(", ")}\n`
+      }
+
+      if (item.missingParameters.length > 0) {
+        text += `   - ❌ 缺失参数: ${item.missingParameters.join("、")}\n`
+      }
+
+      if (item.unreasonableParameters.length > 0) {
+        text += `   - ⚠️ 不合理参数:\n`
+        item.unreasonableParameters.forEach((p: any) => {
+          text += `     - ${p.name}: ${p.reportedValue}（${p.description}）\n`
+        })
+      }
+
+      if (item.predictionResults.length > 0) {
+        text += `   - 预测结果:\n`
+        item.predictionResults.forEach((r: any) => {
+          const exceedIcon = r.isExceed ? "❌ 超标" : r.ratio > 0.8 ? "⚠️ 接近限值" : "✅ 达标"
+          text += `     - ${r.pollutant} @ ${r.location}: ${r.predictedValue}（标准${r.standardLimit}，占标率${(r.ratio * 100).toFixed(1)}%）${exceedIcon}\n`
+        })
+      }
+
+      text += `   - 置信度: ${(item.confidence * 100).toFixed(0)}%\n`
+
+      if (item.issues.length > 0) {
+        text += `   - 问题:\n`
+        item.issues.forEach((issue: any) => {
+          const sev = issue.severity === "critical" ? "🔴" : issue.severity === "major" ? "🟡" : "🟢"
+          text += `     ${sev} [${issue.type}] ${issue.description}\n`
+          text += `       建议: ${issue.suggestion}\n`
+        })
+      }
+      text += `\n`
     })
   }
 
