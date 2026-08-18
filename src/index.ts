@@ -3,6 +3,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools"
 import { NationalRuleEngine } from "./core/engine"
 import { ProvincialRegistry } from "./provinces/registry"
 import { DocumentParser } from "./parsers/document-parser"
+import { EnvironmentalMeasuresValidationTool } from "./tools/environmental-measures-validation"
 import { RiskAssessmentValidationTool } from "./tools/risk-assessment-validation"
 import { PredictionModelValidationTool } from "./tools/prediction-model-validation"
 import { SourceAnalysisTool } from "./tools/source-analysis"
@@ -31,6 +32,7 @@ export function apply(ctx: Context, config: Config) {
   const sourceAnalyzer = new SourceAnalysisTool()
   const predictionValidator = new PredictionModelValidationTool()
   const riskValidator = new RiskAssessmentValidationTool()
+  const measuresValidator = new EnvironmentalMeasuresValidationTool()
 
   // 初始化 MCP 客户端（如果启用）
   let mcpClient: MCPKnowledgeClient | null = null
@@ -460,6 +462,72 @@ function formatRiskAssessmentValidation(value: any): string {
 
       text += `\n`
     })
+  }
+
+  return text
+}
+
+
+// 格式化环保措施验证结果
+function formatMeasuresValidation(value: any): string {
+  let text = `## 环保措施可行性验证报告\n\n`
+  text += `**总体评分**: ${value.overallScore}/100\n`
+  text += `**措施总数**: ${value.totalMeasures}项\n`
+  text += `**可行**: ${value.validMeasures}项 | **需复核**: ${value.suspiciousMeasures}项 | **严重问题**: ${value.errorMeasures}项\n\n`
+
+  if (value.categoryScores) {
+    text += `**分类评分**: `
+    const cats = []
+    if (value.categoryScores.waste_gas !== undefined) cats.push(`废气${value.categoryScores.waste_gas}分`)
+    if (value.categoryScores.waste_water !== undefined) cats.push(`废水${value.categoryScores.waste_water}分`)
+    if (value.categoryScores.solid_waste !== undefined) cats.push(`固废${value.categoryScores.solid_waste}分`)
+    if (value.categoryScores.noise !== undefined) cats.push(`噪声${value.categoryScores.noise}分`)
+    text += cats.join(" | ") + "\n\n"
+  }
+
+  text += `**分析摘要**: ${value.summary}\n\n`
+
+  if (value.details && value.details.length > 0) {
+    text += "### 措施验证详情\n\n"
+
+    // 按类别分组
+    const categories: Record<string, string> = {
+      waste_gas: "🌫️ 废气治理",
+      waste_water: "💧 废水治理",
+      solid_waste: "♻️ 固废处置",
+      noise: "🔇 噪声控制",
+      ecological: "🌿 生态保护"
+    }
+
+    for (const [cat, catName] of Object.entries(categories)) {
+      const catMeasures = value.details.filter((d: any) => d.category === cat)
+      if (catMeasures.length > 0) {
+        text += `#### ${catName}\n\n`
+        catMeasures.forEach((item: any, idx: number) => {
+          const icon = item.issues.length === 0 ? "✅" : item.issues.some((i: any) => i.severity === "critical") ? "❌" : "⚠️"
+          text += `${idx + 1}. ${icon} **${item.measureName}**（${item.technology}）\n`
+          text += `   - 目标污染物: ${item.targetPollutants.join("、")}\n`
+          text += `   - 设计效率: ${item.reportedEfficiency}%（典型: ${item.expectedEfficiency}%）\n`
+
+          if (Object.keys(item.designParameters).length > 0) {
+            text += `   - 设计参数: ${Object.entries(item.designParameters).map(([k, v]) => `${k}=${v}`).join(", ")}\n`
+          }
+
+          text += `   - 达标评估: ${item.meetsStandard ? "✅ 可达标" : "⚠️ 需复核"}\n`
+          text += `   - 置信度: ${(item.confidence * 100).toFixed(0)}%\n`
+
+          if (item.issues.length > 0) {
+            text += `   - 问题:\n`
+            item.issues.forEach((issue: any) => {
+              const sev = issue.severity === "critical" ? "🔴" : issue.severity === "major" ? "🟡" : "🟢"
+              text += `     ${sev} [${issue.type}] ${issue.description}\n`
+              text += `       建议: ${issue.suggestion}\n`
+            })
+          }
+          text += `\n`
+        })
+      }
+    }
   }
 
   return text
