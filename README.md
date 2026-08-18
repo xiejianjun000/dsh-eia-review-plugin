@@ -92,28 +92,118 @@ dsh-eia-review-plugin/
 ```
 
 
-## 定时维护
+## AI 驱动自我优化迭代
 
-插件支持每天凌晨 3:00 自动维护：
+插件具备 **AI 驱动的自我优化迭代能力**，每天凌晨 3:00 自动执行：
 
-```bash
-# 方式1: Cron
-crontab -e
-# 添加: 0 3 * * * /path/to/plugin/scripts/maintenance.sh
+### 监控范围
 
-# 方式2: Systemd Timer
-sudo systemctl enable dsh-eia-review-maintenance.timer
-sudo systemctl start dsh-eia-review-maintenance.timer
+| 监控目标 | 仓库 | 监控内容 |
+|---------|------|---------|
+| DSH 框架 | `deepseek-ai/deepseek-harness` | 新版本、API 变更 |
+| Cordis 内核 | `deepseek-ai/cordis` | 服务框架更新 |
+| MCP 协议 | `modelcontextprotocol/specification` | 协议规范变更 |
+| MCP SDK | `modelcontextprotocol/python-sdk` | SDK 更新 |
+| LangChain | `langchain-ai/langchain` | RAG/Agent 技术 |
+| DeepSeek LLM | `deepseek-ai/deepseek-llm` | 模型能力升级 |
+
+### 自动优化流程
+
+```
+每天凌晨 3:00
+    │
+    ▼
+┌─────────────────┐
+│  GitHub 监控    │ ← 检查 9+ 个 AI 仓库
+│  (API + 缓存)   │
+└────────┬────────┘
+         │
+    ┌────┴────┬────────────┬────────────┐
+    ▼         ▼            ▼            ▼
+ DSH版本    MCP协议      AI能力       依赖安全
+ 监控       变更检测     发展追踪      扫描
+    │         │            │            │
+    ▼         ▼            ▼            ▼
+┌─────────────────────────────────────────┐
+│         自我分析与优化建议生成           │
+│  • 代码质量分析                          │
+│  • 规则库时效性检查                      │
+│  • 知识库同步 (81,071 篇)               │
+│  • 性能瓶颈识别                          │
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│      自动生成优化任务清单               │
+│  • 版本升级建议                          │
+│  • 协议适配方案                          │
+│  • 代码重构建议                          │
+│  • 规则更新提醒                          │
+└─────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│      AI 自动优化执行（可选）             │
+│  • 依赖安全漏洞自动修复                   │
+│  • 配置自动更新                          │
+│  • 生成 PR 草稿                          │
+└─────────────────────────────────────────┘
 ```
 
-维护内容：
-- EHS 知识库同步（81,071 篇文档）
-- 依赖安全漏洞检查
-- 规则库更新检查
-- 日志自动清理（保留30天）
-- 插件健康检查
+### 配置方式
 
-详见 [scripts/README.md](scripts/README.md)
+#### 方式一：Cron（本地/服务器）
+
+```bash
+# 1. 给脚本添加执行权限
+chmod +x scripts/maintenance.sh
+chmod +x scripts/auto-optimize.sh
+
+# 2. 编辑 crontab
+crontab -e
+
+# 3. 添加（每天凌晨 3:00）
+0 3 * * * cd /path/to/plugin && ./scripts/maintenance.sh >> logs/cron.log 2>&1
+30 3 * * * cd /path/to/plugin && ./scripts/auto-optimize.sh >> logs/auto-optimize.log 2>&1
+```
+
+#### 方式二：GitHub Actions（推荐）
+
+已内置 `.github/workflows/daily-maintenance.yml`，自动：
+- 每天凌晨 3:00 UTC+8 触发
+- 监控 GitHub AI 发展
+- 上传维护日志
+- 失败时自动创建 Issue
+
+**需要配置的 Secrets：**
+- `EHS_KB_API_KEY`：知识库 API Key
+- `GITHUB_TOKEN`：自动创建 Issue（已内置）
+
+### 生成的报告
+
+维护后自动生成以下报告：
+
+| 报告文件 | 内容 |
+|---------|------|
+| `.ai-reports/version-updates.md` | DSH/MCP 版本更新提醒 |
+| `.ai-reports/mcp-protocol-updates.md` | MCP 协议变更分析 |
+| `.ai-reports/ai-capability-tracker.md` | AI 能力发展追踪 |
+| `.ai-reports/optimization-suggestions.md` | 代码优化建议 |
+| `.ai-reports/auto-tasks-YYYYMMDD.md` | 自动生成的任务清单 |
+| `logs/maintenance-report-YYYYMMDD.json` | 完整维护报告 |
+
+### 查看维护状态
+
+```bash
+# 查看最新维护报告
+cat .ai-reports/ai-capability-tracker.md
+
+# 查看优化建议
+cat .ai-reports/optimization-suggestions.md
+
+# 查看维护日志
+tail -f logs/maintenance-$(date +%Y%m%d).log
+```
 
 ## 开发
 
