@@ -3,11 +3,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools"
 import { NationalRuleEngine } from "./core/engine"
 import { ProvincialRegistry } from "./provinces/registry"
 import { DocumentParser } from "./parsers/document-parser"
-import { EnvironmentalMeasuresValidationTool } from "./tools/environmental-measures-validation"
-import { RiskAssessmentValidationTool } from "./tools/risk-assessment-validation"
-import { PredictionModelValidationTool } from "./tools/prediction-model-validation"
-import { SourceAnalysisTool } from "./tools/source-analysis"
-import { MCPKnowledgeClient } from "./mcp/client"
+import { EHSKnowledgeClient } from "./mcp/knowledge-client"
 
 export const name = "dsh-eia-review-plugin"
 export const inject = ["tools", "llm", "skills"]
@@ -17,40 +13,44 @@ export interface Config {
   reviewMode: "eia" | "permit" | "both"
   enableMCP: boolean
   strictMode: boolean
-  mcpConfig?: {
-    serverName: string
-    transport: "stdio" | "streamable-http"
-    command?: string
-    args?: string[]
-  }
+  mcpUrl?: string           // MCP SSE 端点 URL
+  mcpApiKey?: string        // MCP API Key (优先从环境变量读取)
 }
 
 export function apply(ctx: Context, config: Config) {
   const nationalEngine = new NationalRuleEngine()
   const provincialRegistry = new ProvincialRegistry()
   const parser = new DocumentParser()
-  const sourceAnalyzer = new SourceAnalysisTool()
-  const predictionValidator = new PredictionModelValidationTool()
-  const riskValidator = new RiskAssessmentValidationTool()
-  const measuresValidator = new EnvironmentalMeasuresValidationTool()
 
-  // 初始化 MCP 客户端（如果启用）
-  let mcpClient: MCPKnowledgeClient | null = null
-  if (config.enableMCP && config.mcpConfig) {
-    mcpClient = new MCPKnowledgeClient(config.mcpConfig)
+  // 初始化 EHS 知识库 MCP 客户端
+  let kbClient: EHSKnowledgeClient | null = null
+  if (config.enableMCP) {
+    const apiKey = config.mcpApiKey || process.env.EHS_KB_API_KEY
+    const mcpUrl = config.mcpUrl || "http://111.230.89.107:8000/sse/"
+
+    if (apiKey) {
+      kbClient = new EHSKnowledgeClient(ctx, {
+        url: mcpUrl,
+        apiKey: apiKey
+      })
+      console.log(`[dsh-eia-review] EHS 知识库 MCP 已连接: ${mcpUrl}`)
+    } else {
+      console.warn("[dsh-eia-review] EHS_KB_API_KEY 未设置，MCP 知识库增强已禁用")
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // 工具1: 环评技术审查（增强版）
+  // 工具1: 环评技术审查
   // ═══════════════════════════════════════════════════════════════════════
   ctx.tools.register(defineTool({
     name: "eia_technical_review",
-    description: "对建设项目环境影响评价报告书/表进行技术审查，输出问题清单与合规性结论。支持国家通用规则+省级规则+MCP知识库增强。",
+    description: "对建设项目环境影响评价报告书/表进行技术审查，支持EHS知识库MCP增强。",
     parameters: {
       reportPath: { type: "string", required: true, description: "环评报告文件路径(PDF/Word)" },
       reportType: { type: "string", required: true, enum: ["report_book", "report_table", "registration"], description: "报告书/报告表/登记表" },
       projectProvince: { type: "string", required: false, description: "项目所在省份代码，如zhejiang" },
-      industry: { type: "string", required: false, description: "行业类别(GB/T4754)" }
+      industry: { type: "string", required: false, description: "行业类别(GB/T4754)" },
+      useKnowledgeBase: { type: "boolean", required: false, description: "是否启用EHS知识库MCP增强", default: true }
     },
     output: {
       schema: {
@@ -61,8 +61,8 @@ export function apply(ctx: Context, config: Config) {
           nationalIssues: { type: "array" },
           provincialIssues: { type: "array" },
           knowledgeRefs: { type: "array" },
-          mcpEnhanced: { type: "boolean" },
-          reviewTime: { type: "number" }
+          kbEnhanced: { type: "boolean" },
+          kbStatus: { type: "string" }
         }
       },
       render: (args, value) => [{
@@ -71,11 +71,18 @@ export function apply(ctx: Context, config: Config) {
       }]
     },
     async execute(args, exec) {
-      const startTime = Date.now()
       const doc = await parser.parse(args.reportPath)
       const effectiveProvince = args.projectProvince || config.province || "national"
+      const useKB = args.useKnowledgeBase !== false && config.enableMCP && kbClient !== null
 
-      // 第一层：国家通用规则审查（保底60%准确率）
+      // 检查知识库状态
+      let kbStatus = "disabled"
+      if (useKB && kbClient) {
+        const status = await kbClient.checkStatus()
+        kbStatus = status.status === "online" ? "connected" : "offline"
+      }
+
+      // 第一层：国家通用规则审查
       const nationalResult = await nationalEngine.review(doc, {
         reportType: args.reportType,
         industry: args.industry,
@@ -83,7 +90,7 @@ export function apply(ctx: Context, config: Config) {
         reviewType: "eia"
       })
 
-      // 第二层：省级规则审查（+15~25%准确率）
+      // 第二层：省级规则审查
       let provincialResult = { issues: [], score: 100 }
       if (effectiveProvince !== "national") {
         const provEngine = provincialRegistry.load(effectiveProvince)
@@ -94,49 +101,76 @@ export function apply(ctx: Context, config: Config) {
         })
       }
 
-      // 第三层：MCP知识库增强（冲击95%）
+      // 第三层：EHS 知识库 MCP 增强
       let allIssues = [...nationalResult.issues, ...provincialResult.issues]
-      let mcpEnhanced = false
+      let kbEnhanced = false
 
-      if (config.enableMCP && mcpClient) {
-        try {
-          await mcpClient.connect()
-          allIssues = await enhanceWithKnowledgeBase(mcpClient, allIssues, effectiveProvince)
-          mcpEnhanced = true
-        } catch (e) {
-          console.warn(`[eia-review] MCP enhancement failed:`, e)
+      if (useKB && kbClient && kbStatus === "connected") {
+        console.log(`[dsh-eia-review] 启用 EHS 知识库增强，处理 ${allIssues.length} 个问题...`)
+
+        for (const issue of allIssues) {
+          if (issue.confidence >= 0.95) continue  // 已高置信度，跳过
+
+          try {
+            const kbResult = await kbClient.verifyIssue(issue, effectiveProvince)
+
+            if (kbResult.confirmed) {
+              issue.confidence = kbResult.confidence
+              issue.kbConfirmed = true
+              issue.kbCitation = kbResult.citation
+              issue.kbRegulation = kbResult.regulation
+              if (kbResult.similarCases) {
+                issue.kbSimilarCases = kbResult.similarCases
+              }
+              console.log(`[dsh-eia-review] [${issue.id}] 知识库确认 ✅ 置信度→${kbResult.confidence}`)
+            } else {
+              console.log(`[dsh-eia-review] [${issue.id}] 知识库未确认 ❌`)
+              if (config.strictMode) {
+                // 严格模式：知识库无法确认则降级
+                issue.confidence = Math.min(issue.confidence, 0.65)
+                issue.kbConfirmed = false
+              }
+            }
+          } catch (e) {
+            console.error(`[dsh-eia-review] [${issue.id}] 知识库查询异常: ${e}`)
+          }
+        }
+
+        kbEnhanced = true
+      }
+
+      // 严格模式：过滤低置信度问题
+      if (config.strictMode) {
+        const beforeCount = allIssues.length
+        allIssues = allIssues.filter(i => i.confidence >= 0.75)
+        if (beforeCount > allIssues.length) {
+          console.log(`[dsh-eia-review] 严格模式过滤: ${beforeCount - allIssues.length} 个低置信度问题已移除`)
         }
       }
 
-      // 严格模式：知识库无法确认则降级
-      if (config.strictMode) {
-        allIssues = allIssues.filter((i: any) => i.confidence >= 0.85)
-      }
-
+      // 计算加权得分
       const totalScore = Math.round(
         nationalResult.score * 0.7 + provincialResult.score * 0.3
       )
 
-      const reviewTime = Date.now() - startTime
-
       return {
-        pass: totalScore >= 85 && !allIssues.some((i: any) => i.severity === "critical"),
+        pass: totalScore >= 85 && !allIssues.some((i: any) => i.severity === "critical" && i.confidence >= 0.85),
         score: totalScore,
         nationalIssues: nationalResult.issues,
         provincialIssues: provincialResult.issues,
-        knowledgeRefs: [...new Set(allIssues.flatMap((i: any) => i.basis))],
-        mcpEnhanced,
-        reviewTime
+        knowledgeRefs: [...new Set(allIssues.flatMap((i: any) => i.basis || []))],
+        kbEnhanced,
+        kbStatus
       }
     }
   }))
 
   // ═══════════════════════════════════════════════════════════════════════
-  // 工具2: 排污许可证技术审查（增强版）
+  // 工具2: 排污许可证技术审查
   // ═══════════════════════════════════════════════════════════════════════
   ctx.tools.register(defineTool({
     name: "permit_technical_review",
-    description: "对排污许可证申请材料进行技术审查，依据HJ 1299-2023等标准。支持全国通用+省级特色规则。",
+    description: "对排污许可证申请材料进行技术审查，支持EHS知识库MCP增强。",
     parameters: {
       applicationPath: { type: "string", required: true },
       reviewType: { type: "string", required: true, enum: ["formal", "substantive", "full"] },
@@ -157,120 +191,73 @@ export function apply(ctx: Context, config: Config) {
         pass: nationalResult.score >= 85,
         score: nationalResult.score,
         issues: nationalResult.issues,
-        knowledgeRefs: nationalResult.knowledgeRefs
+        knowledgeRefs: nationalResult.knowledgeRefs,
+        kbEnhanced: false,
+        kbStatus: kbClient ? (await kbClient.checkStatus()).status : "disabled"
       }
     }
   }))
 
   // ═══════════════════════════════════════════════════════════════════════
-  
+  // 工具3: 知识库状态检查
   // ═══════════════════════════════════════════════════════════════════════
-  // 工具2.5: 源强分析（新增）
-  // ═══════════════════════════════════════════════════════════════════════
-  ctx.tools.register(defineTool({
-    name: "eia_source_analysis",
-    description: "对环评报告中的污染物源强核算进行深度分析，自动识别源强数据、验证计算准确性、检查遗漏污染物。",
-    parameters: {
-      reportPath: { type: "string", required: true, description: "环评报告文件路径" },
-      industryCode: { type: "string", required: true, description: "行业代码(GB/T4754)" }
-    },
-    output: {
-      schema: { type: "object" },
-      render: (args, value) => [{
-        type: "text",
-        text: formatSourceAnalysis(value)
-      }]
-    },
-    async execute(args, exec) {
-      const doc = await parser.parse(args.reportPath)
-      return await sourceAnalyzer.analyze(doc, args.industryCode)
-    }
-  }))
-
-// 工具3: 行业标准查询（新增）
-  // ═══════════════════════════════════════════════════════════════════════
-  ctx.tools.register(defineTool({
-    name: "eia_industry_info",
-    description: "查询行业环评/排污许可相关信息，包括特征污染物、适用标准、管理要求等。",
-    parameters: {
-      industryCode: { type: "string", required: true, description: "行业代码(GB/T4754)" },
-      queryType: { type: "string", required: false, enum: ["eia", "permit", "standards", "all"], default: "all" }
-    },
-    output: {
-      schema: { type: "object" },
-      render: (args, value) => [{
-        type: "text",
-        text: formatIndustryInfo(value)
-      }]
-    },
-    async execute(args, exec) {
-      if (!mcpClient) {
-        return { error: "MCP client not configured" }
+  if (kbClient) {
+    ctx.tools.register(defineTool({
+      name: "ehs_kb_status",
+      description: "检查 EHS 知识库 MCP 连接状态",
+      parameters: {},
+      output: {
+        schema: { type: "object" },
+        render: (args, value) => [{
+          type: "text",
+          text: `## EHS 知识库状态\n\n` +
+                `**连接状态**: ${value.status === "online" ? "🟢 在线" : "🔴 离线"}\n` +
+                `**服务端点**: ${value.url || "未配置"}\n` +
+                `**版本**: ${value.version || "未知"}\n` +
+                `**文档数**: ${value.documentCount || 0}\n` +
+                `**最后同步**: ${value.lastSync || "未同步"}`
+        }]
+      },
+      async execute() {
+        const status = await kbClient!.checkStatus()
+        return {
+          ...status,
+          url: config.mcpUrl || "http://111.230.89.107:8000/sse/"
+        }
       }
+    }))
 
-      try {
-        await mcpClient.connect()
-        return await mcpClient.getIndustryInfo(args.industryCode, args.queryType || "all")
-      } catch (e) {
-        return { error: `Failed to query industry info: ${e}` }
+    // 工具4: 知识库搜索（调试用）
+    ctx.tools.register(defineTool({
+      name: "ehs_kb_search",
+      description: "搜索 EHS 知识库（调试/验证用）",
+      parameters: {
+        query: { type: "string", required: true },
+        topK: { type: "number", required: false, default: 5 },
+        province: { type: "string", required: false }
+      },
+      output: { schema: { type: "object" }, render: () => [] },
+      async execute(args) {
+        return kbClient!.search(args.query, {
+          topK: args.topK || 5,
+          province: args.province
+        })
       }
-    }
-  }))
+    }))
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   // 注册 Skill
   // ═══════════════════════════════════════════════════════════════════════
   ctx.skills?.register?.({
     name: "eia-review-expert",
-    description: "环境影响评价技术审查专家，精通国家法规与省级政策，配备行业知识图谱和法规知识库",
-    body: `你是环评技术审查专家，依据以下规则执行审查：
-1. 优先执行国家通用规则（22条增强版规则，含行业数据库、标准API、危废DB、核算引擎）
-2. 根据项目所在省份加载省级规则库
-3. 对低置信度问题查询MCP知识库确认（向量检索+知识图谱+重排序）
-4. 输出结构化审查报告：通过/不通过、得分、问题清单、法规依据、行业特征分析
-
-特别注意事项：
-- 2026年3月12日后项目必须引用《生态环境法典》
-- 长江经济带项目必须论证负面清单符合性
-- 化工/石化/钢铁等重点行业必须按审批原则论证
-- 2025年9月后项目关注排污许可证质量提升要求
-- 源强核算必须使用标准方法（物料衡算/类比/实测/产排污系数）
-- 排放标准必须引用现行有效版本`
+    description: "环境影响评价技术审查专家，集成EHS知识库MCP",
+    body: `你是环评技术审查专家，集成EHS知识库MCP增强能力：
+1. 优先执行国家通用规则（20条）
+2. 根据项目所在省份加载省级规则
+3. 对低置信度问题自动查询EHS知识库确认
+4. 输出结构化审查报告：通过/不通过、得分、问题清单、法规依据、知识库引用`
   })
-}
-
-// 知识库增强：对低置信度问题查询MCP
-async function enhanceWithKnowledgeBase(client: MCPKnowledgeClient, issues: any[], province: string) {
-  for (const issue of issues) {
-    if (issue.confidence >= 0.85) continue
-
-    try {
-      const result = await client.search(
-        `${issue.name} ${issue.description} 环评审查依据`,
-        {
-          topK: 3,
-          filter: {
-            level: issue.level === "provincial" ? "provincial" : "national",
-            province: province !== "national" ? province : undefined
-          }
-        }
-      )
-
-      const best = result.documents?.[0]
-      if (best && best.score > 0.88) {
-        issue.confidence = 0.95
-        issue.basis = [...(issue.basis || []), best.source]
-        issue.knowledgeRef = best.article
-      } else if (best && best.score > 0.75) {
-        issue.confidence = 0.85
-        issue.basis = [...(issue.basis || []), best.source]
-      }
-    } catch (e) {
-      // MCP查询失败不影响主流程
-    }
-  }
-
-  return issues
 }
 
 // 格式化审查结果
@@ -284,249 +271,21 @@ function formatReviewResult(value: any, province: string): string {
   text += `**省份**: ${province === "national" ? "全国通用" : province}\n`
   text += `**结论**: ${value.pass ? "✅ 通过" : "❌ 不通过"}\n`
   text += `**得分**: ${value.score}/100\n`
-  text += `**审查耗时**: ${value.reviewTime || "N/A"}ms\n`
-  text += `**MCP增强**: ${value.mcpEnhanced ? "✅ 已启用" : "❌ 未启用"}\n`
+  text += `**知识库**: ${value.kbEnhanced ? "🟢 已增强" : value.kbStatus === "connected" ? "🟡 未启用" : "🔴 未连接"}\n`
   text += `**问题统计**: 🔴Critical ${critical} | 🟡Major ${major} | 🟢Minor ${minor}\n\n`
 
   if (allIssues.length > 0) {
-    text += "### 问题清单\n\n"
-    allIssues.forEach((issue: any, idx: number) => {
+    text += `### 问题清单\n\n`
+    for (const [idx, issue] of allIssues.entries()) {
       const icon = issue.severity === "critical" ? "🔴" : issue.severity === "major" ? "🟡" : "🟢"
-      text += `${idx + 1}. ${icon} **[${issue.level === "national" ? "国家" : "省级"}] ${issue.name}**\n`
-      text += `   - 描述: ${issue.description}\n`
+      const kbIcon = issue.kbConfirmed === true ? "✅" : issue.kbConfirmed === false ? "❓" : ""
+      text += `${idx + 1}. ${icon} **[${issue.level === "national" ? "国家" : "省级"}] ${issue.name}** ${kbIcon}\n`
       text += `   - 详情: ${issue.detail}\n`
       text += `   - 位置: ${issue.location}\n`
       text += `   - 依据: ${issue.basis?.join("、") || "-"}\n`
+      if (issue.kbCitation) text += `   - 知识库引用: ${issue.kbCitation}\n`
+      if (issue.kbRegulation) text += `   - 法规条款: ${issue.kbRegulation}\n`
       text += `   - 置信度: ${(issue.confidence * 100).toFixed(0)}%\n\n`
-    })
-  }
-
-  return text
-}
-
-// 格式化行业信息
-function formatIndustryInfo(info: any): string {
-  if (info.error) return `## 行业信息查询\n\n❌ 错误: ${info.error}`
-
-  let text = `## 行业信息: ${info.name} (${info.code})\n\n`
-
-  if (info.keyPollutants) {
-    text += `**特征污染物**: ${info.keyPollutants.join("、")}\n\n`
-  }
-
-  if (info.applicableStandards) {
-    text += `**适用标准**: ${info.applicableStandards.join("、")}\n\n`
-  }
-
-  if (info.eiaRequirements) {
-    text += `**环评要求**: ${info.eiaRequirements.join("、")}\n\n`
-  }
-
-  if (info.permitRequirements) {
-    text += `**排污许可要求**: ${info.permitRequirements.join("、")}\n\n`
-  }
-
-  if (info.processes) {
-    text += "**典型工艺**:\n\n"
-    info.processes.forEach((p: any) => {
-      text += `- ${p.name}\n`
-      text += `  - 污染物: ${p.pollutants.map((pl: any) => `${pl.name}(${pl.typicalValue}${pl.unit})`).join("、")}\n`
-      text += `  - 控制措施: ${p.controlMeasures.join("、")}\n\n`
-    })
-  }
-
-  return text
-}
-
-
-// 格式化预测模型验证结果
-function formatPredictionModelValidation(value: any): string {
-  let text = `## 环境影响预测模型验证报告\n\n`
-  text += `**总体评分**: ${value.overallScore}/100\n`
-  text += `**模型总数**: ${value.totalModels}个\n`
-  text += `**验证通过**: ${value.validModels}个 | **需复核**: ${value.suspiciousModels}个 | **错误**: ${value.errorModels}个\n\n`
-  text += `**分析摘要**: ${value.summary}\n\n`
-
-  if (value.details && value.details.length > 0) {
-    text += "### 模型验证详情\n\n"
-    value.details.forEach((item: any, idx: number) => {
-      const icon = item.issues.length === 0 ? "✅" : item.issues.some((i: any) => i.severity === "critical") ? "❌" : "⚠️"
-      text += `${idx + 1}. ${icon} **${item.modelName}**（${item.modelType}）\n`
-
-      if (Object.keys(item.reportedParameters).length > 0) {
-        text += `   - 报告参数: ${Object.entries(item.reportedParameters).map(([k, v]) => `${k}=${v}`).join(", ")}\n`
-      }
-
-      if (item.missingParameters.length > 0) {
-        text += `   - ❌ 缺失参数: ${item.missingParameters.join("、")}\n`
-      }
-
-      if (item.unreasonableParameters.length > 0) {
-        text += `   - ⚠️ 不合理参数:\n`
-        item.unreasonableParameters.forEach((p: any) => {
-          text += `     - ${p.name}: ${p.reportedValue}（${p.description}）\n`
-        })
-      }
-
-      if (item.predictionResults.length > 0) {
-        text += `   - 预测结果:\n`
-        item.predictionResults.forEach((r: any) => {
-          const exceedIcon = r.isExceed ? "❌ 超标" : r.ratio > 0.8 ? "⚠️ 接近限值" : "✅ 达标"
-          text += `     - ${r.pollutant} @ ${r.location}: ${r.predictedValue}（标准${r.standardLimit}，占标率${(r.ratio * 100).toFixed(1)}%）${exceedIcon}\n`
-        })
-      }
-
-      text += `   - 置信度: ${(item.confidence * 100).toFixed(0)}%\n`
-
-      if (item.issues.length > 0) {
-        text += `   - 问题:\n`
-        item.issues.forEach((issue: any) => {
-          const sev = issue.severity === "critical" ? "🔴" : issue.severity === "major" ? "🟡" : "🟢"
-          text += `     ${sev} [${issue.type}] ${issue.description}\n`
-          text += `       建议: ${issue.suggestion}\n`
-        })
-      }
-      text += `\n`
-    })
-  }
-
-  return text
-}
-
-
-// 格式化环境风险评价验证结果
-function formatRiskAssessmentValidation(value: any): string {
-  let text = `## 环境风险评价验证报告\n\n`
-  text += `**总体评分**: ${value.overallScore}/100\n`
-  text += `**评价等级**: ${value.assessmentLevel || "未识别"}\n`
-  text += `**重大危险源**: ${value.hasMajorHazard ? "⚠️ 存在" : "✅ 不存在"}\n`
-  text += `**事故情景**: ${value.totalScenarios}个（通过${value.validScenarios} | 需复核${value.suspiciousScenarios} | 错误${value.errorScenarios}）\n\n`
-  text += `**分析摘要**: ${value.summary}\n\n`
-
-  if (value.details && value.details.length > 0) {
-    text += "### 验证详情\n\n"
-    value.details.forEach((section: any, idx: number) => {
-      const icon = section.issues.length === 0 ? "✅" : section.issues.some((i: any) => i.severity === "critical") ? "❌" : "⚠️"
-      text += `${idx + 1}. ${icon} **${section.riskType || section.assessmentLevel || "风险评价"}**\n`
-
-      // 危险物质识别
-      if (section.identifiedHazards && section.identifiedHazards.length > 0) {
-        text += `   **危险物质**:\n`
-        section.identifiedHazards.forEach((h: any) => {
-          const majorIcon = h.isMajor ? "🔴 重大危险源" : "🟢"
-          text += `     - ${h.substance}（CAS: ${h.CAS}）: 储存${h.maxStorage}吨 / 临界量${h.threshold}吨 = 比值${h.ratio.toFixed(2)} ${majorIcon}\n`
-        })
-      }
-
-      // 源项分析
-      if (section.sourceTermAnalysis && section.sourceTermAnalysis.length > 0) {
-        text += `   **源项分析**:\n`
-        section.sourceTermAnalysis.forEach((s: any) => {
-          text += `     - ${s.scenario}: 泄漏量${s.releaseAmount}吨，持续${s.releaseDuration}分钟，速率${s.releaseRate.toFixed(2)}吨/分钟\n`
-          if (s.issues.length > 0) {
-            s.issues.forEach((i: any) => {
-              text += `       ${i.severity === "critical" ? "🔴" : "🟡"} ${i.description}\n`
-            })
-          }
-        })
-      }
-
-      // 风险防范措施
-      if (section.preventionMeasures && section.preventionMeasures.length > 0) {
-        text += `   **风险防范措施**:\n`
-        section.preventionMeasures.forEach((pm: any) => {
-          text += `     - ${pm.category}: ${pm.items.length > 0 ? pm.items.join("、") : "无"}\n`
-          if (pm.missing.length > 0) {
-            text += `       ⚠️ 缺少: ${pm.missing.slice(0, 3).join("、")}${pm.missing.length > 3 ? "等" : ""}\n`
-          }
-        })
-      }
-
-      // 应急预案
-      if (section.emergencyPlan) {
-        text += `   **应急预案**: ${section.emergencyPlan.hasPlan ? "✅ 有" : "❌ 无"}预案 | ${section.emergencyPlan.hasDrill ? "✅ 有" : "❌ 无"}演练 | ${section.emergencyPlan.hasEquipment ? "✅ 有" : "❌ 无"}物资\n`
-        if (section.emergencyPlan.missingItems.length > 0) {
-          text += `     ⚠️ 缺少: ${section.emergencyPlan.missingItems.join("、")}\n`
-        }
-      }
-
-      // 问题汇总
-      if (section.issues.length > 0) {
-        text += `   **问题**:\n`
-        section.issues.forEach((issue: any) => {
-          const sev = issue.severity === "critical" ? "🔴" : issue.severity === "major" ? "🟡" : "🟢"
-          text += `     ${sev} [${issue.type}] ${issue.description}\n`
-          text += `       建议: ${issue.suggestion}\n`
-        })
-      }
-
-      text += `\n`
-    })
-  }
-
-  return text
-}
-
-
-// 格式化环保措施验证结果
-function formatMeasuresValidation(value: any): string {
-  let text = `## 环保措施可行性验证报告\n\n`
-  text += `**总体评分**: ${value.overallScore}/100\n`
-  text += `**措施总数**: ${value.totalMeasures}项\n`
-  text += `**可行**: ${value.validMeasures}项 | **需复核**: ${value.suspiciousMeasures}项 | **严重问题**: ${value.errorMeasures}项\n\n`
-
-  if (value.categoryScores) {
-    text += `**分类评分**: `
-    const cats = []
-    if (value.categoryScores.waste_gas !== undefined) cats.push(`废气${value.categoryScores.waste_gas}分`)
-    if (value.categoryScores.waste_water !== undefined) cats.push(`废水${value.categoryScores.waste_water}分`)
-    if (value.categoryScores.solid_waste !== undefined) cats.push(`固废${value.categoryScores.solid_waste}分`)
-    if (value.categoryScores.noise !== undefined) cats.push(`噪声${value.categoryScores.noise}分`)
-    text += cats.join(" | ") + "\n\n"
-  }
-
-  text += `**分析摘要**: ${value.summary}\n\n`
-
-  if (value.details && value.details.length > 0) {
-    text += "### 措施验证详情\n\n"
-
-    // 按类别分组
-    const categories: Record<string, string> = {
-      waste_gas: "🌫️ 废气治理",
-      waste_water: "💧 废水治理",
-      solid_waste: "♻️ 固废处置",
-      noise: "🔇 噪声控制",
-      ecological: "🌿 生态保护"
-    }
-
-    for (const [cat, catName] of Object.entries(categories)) {
-      const catMeasures = value.details.filter((d: any) => d.category === cat)
-      if (catMeasures.length > 0) {
-        text += `#### ${catName}\n\n`
-        catMeasures.forEach((item: any, idx: number) => {
-          const icon = item.issues.length === 0 ? "✅" : item.issues.some((i: any) => i.severity === "critical") ? "❌" : "⚠️"
-          text += `${idx + 1}. ${icon} **${item.measureName}**（${item.technology}）\n`
-          text += `   - 目标污染物: ${item.targetPollutants.join("、")}\n`
-          text += `   - 设计效率: ${item.reportedEfficiency}%（典型: ${item.expectedEfficiency}%）\n`
-
-          if (Object.keys(item.designParameters).length > 0) {
-            text += `   - 设计参数: ${Object.entries(item.designParameters).map(([k, v]) => `${k}=${v}`).join(", ")}\n`
-          }
-
-          text += `   - 达标评估: ${item.meetsStandard ? "✅ 可达标" : "⚠️ 需复核"}\n`
-          text += `   - 置信度: ${(item.confidence * 100).toFixed(0)}%\n`
-
-          if (item.issues.length > 0) {
-            text += `   - 问题:\n`
-            item.issues.forEach((issue: any) => {
-              const sev = issue.severity === "critical" ? "🔴" : issue.severity === "major" ? "🟡" : "🟢"
-              text += `     ${sev} [${issue.type}] ${issue.description}\n`
-              text += `       建议: ${issue.suggestion}\n`
-            })
-          }
-          text += `\n`
-        })
-      }
     }
   }
 
