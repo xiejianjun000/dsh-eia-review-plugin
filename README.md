@@ -91,6 +91,30 @@ dsh-eia-review-plugin/
 └── preset.yml             # Agent预设
 ```
 
+
+## 定时维护
+
+插件支持每天凌晨 3:00 自动维护：
+
+```bash
+# 方式1: Cron
+crontab -e
+# 添加: 0 3 * * * /path/to/plugin/scripts/maintenance.sh
+
+# 方式2: Systemd Timer
+sudo systemctl enable dsh-eia-review-maintenance.timer
+sudo systemctl start dsh-eia-review-maintenance.timer
+```
+
+维护内容：
+- EHS 知识库同步（81,071 篇文档）
+- 依赖安全漏洞检查
+- 规则库更新检查
+- 日志自动清理（保留30天）
+- 插件健康检查
+
+详见 [scripts/README.md](scripts/README.md)
+
 ## 开发
 
 ```bash
